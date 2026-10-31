@@ -266,4 +266,68 @@ def whatsapp_triage(task, ctx):
     return True
 
 
-SKILLS = {"blinkit": blinkit, "whatsapp_triage": whatsapp_triage}
+# ───────────────────────────── Hinge: review a few profiles, you decide each ───────────────────────
+
+HINGE = "co.hinge.app"
+WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+
+
+def hinge_count(task):
+    m = re.search(r"\b(\d{1,2})\b", task)
+    if m:
+        return max(1, min(10, int(m.group(1))))
+    w = next((WORDS[x] for x in re.findall(r"[a-z]+", task.lower()) if x in WORDS), None)
+    return w or 3
+
+
+def hinge(task, ctx):
+    """The user decides like/skip per profile. Likes are never sent without an explicit 'like'."""
+    total, t0 = hinge_count(task), time.time()
+    skip_all = bool(re.search(r"\b(skip|pass) (all|everyone|them)\b", task.lower()))
+    launch(ctx, HINGE)
+    got = wait_for(ctx, r'"Skip [^"]+" \(clickable\)', HINGE, timeout=15)
+    if not got:
+        return False
+    step(ctx, f"1. Opened Hinge — reviewing {total} profile(s)")
+    liked = skipped = 0
+    for i in range(total):
+        got = wait_for(ctx, r'"Skip [^"]+" \(clickable\)', HINGE, timeout=8)
+        if not got:
+            ctx.report("info", "No more profiles on screen")
+            break
+        _, tree, centers = got
+        skip_line = find(tree, r'"Skip [^"]+" \(clickable\)')[0]
+        name = re.search(r'"Skip ([^"]+)"', skip_line).group(1)
+        prompt = next((re.search(r'Answer: ([^"]+)"', l).group(1) for l in find(tree, r'"Prompt: .*Answer: ')), "")
+        if skip_all:
+            choice = "skip"
+        else:
+            q = f"{name}" + (f' — "{prompt[:90]}"' if prompt else "") + " · like, skip, or stop?"
+            choice = (ctx.ask(q) or "stop").strip().lower()
+        if choice.startswith("stop") or choice in ("", "s top", "end", "done"):
+            break
+        if choice.startswith("like") or choice in ("yes", "y", "❤️", "heart"):
+            like = find(tree, r'"Like photo" \(clickable\)') or find(tree, r'"Like [^"]*" \(clickable\)')
+            if not like:
+                ctx.report("info", f"Couldn't find a like button for {name}")
+                break
+            tap(ctx, centers, like[0])
+            got = wait_for(ctx, r'"Send [Ll]ike"', HINGE, timeout=5)
+            if not got:
+                ctx.adb("shell", "input", "keyevent", "4")
+                ctx.report("info", f"Like sheet didn't appear for {name} — skipped nothing, stopped")
+                break
+            _, t2, c2 = got
+            tap(ctx, c2, find(t2, r'"Send [Ll]ike"')[0])
+            liked += 1
+            step(ctx, f"{i + 2}. Liked {name}")
+        else:
+            tap(ctx, centers, skip_line)
+            skipped += 1
+            step(ctx, f"{i + 2}. Skipped {name}")
+        time.sleep(1.5)
+    ctx.report("done", f"Hinge: {liked} liked, {skipped} skipped · {time.time() - t0:.0f}s", "done")
+    return True
+
+
+SKILLS = {"blinkit": blinkit, "whatsapp_triage": whatsapp_triage, "hinge": hinge}

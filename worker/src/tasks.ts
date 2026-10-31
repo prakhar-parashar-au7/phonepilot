@@ -18,7 +18,7 @@
 export type TaskStatus = "queued" | "running" | "waiting" | "done" | "failed" | "cancelled" | "expired";
 export type TaskEvent = { at: number; kind: "info" | "step" | "done" | "error" | "ask" | "answer"; text: string };
 export type Task = { id: string; task: string; skill: string | null; status: TaskStatus; createdAt: number; updatedAt: number; events: TaskEvent[]; question?: string | null; answer?: string | null };
-export const SKILLS = ["blinkit", "whatsapp_triage"];
+export const SKILLS = ["blinkit", "whatsapp_triage", "hinge"];
 
 export interface KvStorage {
   get<T>(key: string): Promise<T | undefined>;
@@ -421,6 +421,7 @@ footer{text-align:center;padding:24px 16px 32px}
         <button class="skill on" data-skill="" type="button">✨ Any app</button>
         <button class="skill" data-skill="blinkit" type="button">🛒 Blinkit</button>
         <button class="skill" data-skill="whatsapp_triage" type="button">💬 WhatsApp catch-up</button>
+        <button class="skill" data-skill="hinge" type="button">💘 Hinge</button>
       </div>
       <div class="skill-hint" id="skillHint">Describe any task on any app.</div>
       <div class="voice-box">
@@ -554,6 +555,7 @@ clearBtn.onclick=async()=>{
 let skill='';
 const HINTS={'':['Describe any task on any app.','Or type your request here...'],
   blinkit:['Blinkit skill: just name the item — it searches, adds to cart, and stops at checkout.','e.g. order tomato'],
+  hinge:['Shows you each profile — you say like, skip, or stop. It never likes anyone on its own.','e.g. review 3 profiles on Hinge'],
   whatsapp_triage:['Reads unread chats and replies only to urgent personal messages. Never replies in groups.','e.g. check my WhatsApp and reply to anything urgent']};
 document.querySelectorAll('.skill').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.skill').forEach(x=>x.classList.remove('on'));b.classList.add('on');skill=b.dataset.skill;

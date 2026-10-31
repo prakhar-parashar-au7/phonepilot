@@ -236,6 +236,8 @@ class SkillCtx:
 SKILL_SCOPE = {
     "blinkit": "Use ONLY the Blinkit app (package com.grofers.customerapp); never open any other app. "
                "Search for the item, add it to the cart, open the cart, and stop before payment. Task: ",
+    "hinge": "Use ONLY Hinge (package co.hinge.app); never open any other app. Never like, comment, or message anyone "
+             "unless the user explicitly says like for that person; ask_user for each profile. Task: ",
     "whatsapp_triage": "Use ONLY WhatsApp (package com.whatsapp); never open any other app. Never send in group chats. Task: ",
 }
 
