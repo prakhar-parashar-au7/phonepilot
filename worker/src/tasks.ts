@@ -11,6 +11,7 @@
  *   POST /v1/host/next                        -> {task} | {task:null}
  *   POST /v1/host/tasks/:id/events {kind,text,status?} -> {cancelled}   kind "ask" + status "waiting" asks the user
  *   POST /v1/host/tasks/:id/answer            -> {status, answer|null}
+ *   POST /v1/host/web-search {query}          -> {text}   (Anakin search; key stays on the server)
  *
  * The phone host only ever connects outward; nothing on the internet can reach the phone.
  */
@@ -18,7 +19,7 @@
 export type TaskStatus = "queued" | "running" | "waiting" | "done" | "failed" | "cancelled" | "expired";
 export type TaskEvent = { at: number; kind: "info" | "step" | "done" | "error" | "ask" | "answer"; text: string };
 export type Task = { id: string; task: string; skill: string | null; status: TaskStatus; createdAt: number; updatedAt: number; events: TaskEvent[]; question?: string | null; answer?: string | null };
-export const SKILLS = ["blinkit", "whatsapp_triage", "hinge"];
+export const SKILLS = ["blinkit", "whatsapp_triage", "hinge", "web"];
 
 export interface KvStorage {
   get<T>(key: string): Promise<T | undefined>;
@@ -146,6 +147,8 @@ type Inbox = { fetch(request: Request): Promise<Response> };
 export type TaskEnv = {
   PHONEPILOT_DEVICE_TOKEN: string;
   PHONEPILOT_WEB_PASSCODE?: string;
+  ANAKIN_API_KEY?: string;
+  fetch?: typeof fetch;
   TASK_INBOX?: { idFromName(name: string): unknown; get(id: unknown): Inbox };
   DEVICE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> };
 };
@@ -164,6 +167,37 @@ const ID = /^[a-z0-9]+-[a-f0-9]{8}$/;
 async function call(env: TaskEnv, op: string, body: unknown = {}): Promise<Response> {
   const inbox = env.TASK_INBOX!.get(env.TASK_INBOX!.idFromName("default"));
   return inbox.fetch(new Request(`https://inbox/${op}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }));
+}
+
+/** Flatten Anakin's search response into short readable text (shape-tolerant). */
+export function summarizeSearch(data: unknown): string {
+  const out: string[] = [];
+  const d = (data ?? {}) as Record<string, unknown>;
+  for (const key of ["answer", "summary", "response", "result"]) if (typeof d[key] === "string") out.push(String(d[key]));
+  const list = [d.results, d.data, d.sources, (d.data as Record<string, unknown> | undefined)?.results].find(Array.isArray) as unknown[] | undefined;
+  for (const item of (list ?? []).slice(0, 4)) {
+    const r = (item ?? {}) as Record<string, unknown>;
+    const title = String(r.title ?? r.name ?? "").trim();
+    const body = String(r.snippet ?? r.content ?? r.description ?? r.text ?? "").replace(/\s+/g, " ").trim().slice(0, 220);
+    const url = String(r.url ?? r.link ?? "").trim();
+    if (title || body) out.push(`• ${title}${body ? " — " + body : ""}${url ? " (" + url + ")" : ""}`);
+  }
+  return (out.join("\n") || JSON.stringify(data).slice(0, 600)).slice(0, 1500);
+}
+
+async function webSearch(request: Request, env: TaskEnv): Promise<Response> {
+  if (!env.ANAKIN_API_KEY) return fail(503, "web_search_not_configured");
+  let body: unknown;
+  try { body = await request.json(); } catch { return fail(400, "invalid_request"); }
+  const query = typeof (body as { query?: unknown })?.query === "string" ? (body as { query: string }).query.trim() : "";
+  if (query.length < 2 || query.length > 300 || SENSITIVE.test(query)) return fail(400, "invalid_request");
+  const res = await (env.fetch ?? fetch)("https://api.anakin.io/v1/search", {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "application/json", "x-api-key": env.ANAKIN_API_KEY },
+    body: JSON.stringify({ prompt: query, limit: 5 }),
+  });
+  if (!res.ok) return fail(502, `web_search_failed_${res.status}`);
+  return json({ text: summarizeSearch(await res.json()) });
 }
 
 /** Returns a Response for task routes, or null if the path isn't a task route. */
@@ -223,6 +257,7 @@ export async function handleTaskRoutes(request: Request, env: TaskEnv): Promise<
   if (!auth || !safeEqual(auth[1], env.PHONEPILOT_DEVICE_TOKEN)) return fail(401, "unauthorized");
   if (request.method !== "POST") return fail(405, "method_not_allowed");
   if (pathname === "/v1/host/next") return call(env, "claim");
+  if (pathname === "/v1/host/web-search") return webSearch(request, env);
   const a = pathname.match(/^\/v1\/host\/tasks\/([^/]+)\/answer$/);
   if (a && ID.test(a[1])) {
     const result = await (await call(env, "take-answer", { id: a[1] })).json();
@@ -422,6 +457,7 @@ footer{text-align:center;padding:24px 16px 32px}
         <button class="skill" data-skill="blinkit" type="button">🛒 Blinkit</button>
         <button class="skill" data-skill="whatsapp_triage" type="button">💬 WhatsApp catch-up</button>
         <button class="skill" data-skill="hinge" type="button">💘 Hinge</button>
+        <button class="skill" data-skill="web" type="button">🌐 Web lookup</button>
       </div>
       <div class="skill-hint" id="skillHint">Describe any task on any app.</div>
       <div class="voice-box">
@@ -555,6 +591,7 @@ clearBtn.onclick=async()=>{
 let skill='';
 const HINTS={'':['Describe any task on any app.','Or type your request here...'],
   blinkit:['Blinkit skill: just name the item — it searches, adds to cart, and stops at checkout.','e.g. order tomato'],
+  web:['Searches the live web with Anakin and shows the answer here — no phone needed.','e.g. tomato price in Gurgaon today'],
   hinge:['Shows you each profile — you say like, skip, or stop. It never likes anyone on its own.','e.g. review 3 profiles on Hinge'],
   whatsapp_triage:['Reads unread chats and replies only to urgent personal messages. Never replies in groups.','e.g. check my WhatsApp and reply to anything urgent']};
 document.querySelectorAll('.skill').forEach(b=>b.onclick=()=>{

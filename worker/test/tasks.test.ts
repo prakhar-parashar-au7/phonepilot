@@ -29,7 +29,7 @@ function setup() {
     if (init.host) headers.authorization = "Bearer dev-token";
     return worker.fetch(new Request(`https://w.example${path}`, { method: init.method ?? "GET", headers, body: init.body }), env as never);
   };
-  return { req, advance: (ms: number) => { now += ms; } };
+  return { req, env: env as Record<string, unknown>, advance: (ms: number) => { now += ms; } };
 }
 
 describe("hosted tasks", () => {
@@ -110,6 +110,21 @@ describe("hosted tasks", () => {
     expect((await req("/v1/tasks", { method: "POST", web: true, body: JSON.stringify({ task: "order tomato", skill: "rm-rf" }) })).status).toBe(400);
     const claimed = (await (await req("/v1/host/next", { method: "POST", host: true })).json()) as { task: { skill: string } };
     expect(claimed.task.skill).toBe("blinkit");
+  });
+
+  it("proxies web search to Anakin with the server-side key and summarizes it", async () => {
+    const { req, env } = setup();
+    env.ANAKIN_API_KEY = "anakin-test";
+    env.fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      expect(String(url)).toBe("https://api.anakin.io/v1/search");
+      expect((init?.headers as Record<string, string>)["x-api-key"]).toBe("anakin-test");
+      return Response.json({ answer: "Tomatoes are ₹30/kg", results: [{ title: "Mandi prices", snippet: "Gurgaon", url: "https://x.example" }] });
+    }) as never;
+    const res = await req("/v1/host/web-search", { method: "POST", host: true, body: JSON.stringify({ query: "tomato price gurgaon" }) });
+    const { text } = (await res.json()) as { text: string };
+    expect(text).toContain("₹30/kg");
+    expect(text).toContain("Mandi prices");
+    expect((await req("/v1/host/web-search", { method: "POST", web: true, body: "{}" })).status).toBe(401);
   });
 
   it("blocks sensitive tasks and keeps next-action 404s intact", async () => {

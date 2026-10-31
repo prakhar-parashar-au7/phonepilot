@@ -221,6 +221,13 @@ class SkillCtx:
             print(f"{C['r']}decide failed: {e}{C['x']}")
             return None
 
+    def web_search(self, query):
+        try:
+            return host_call("/v1/host/web-search", self.tok, {"query": query[:300]}).get("text")
+        except urllib.error.HTTPError as e:
+            print(f"{C['r']}web search failed: HTTP {e.code} {e.read().decode()[:120]}{C['x']}")
+            return None
+
     def type_text(self, text):
         adb("shell", "input", "text", adb_text(text))
 
@@ -250,7 +257,7 @@ def skill_task(skill, task):
 def run_skill(skill, task, tok, report, wait_answer=None):
     """True if the skill finished the task (or stopped cleanly); False to fall back to the LLM loop."""
     ctx = SkillCtx(tok, report, wait_answer)
-    if phone_locked():
+    if skill is not SKILLS.get("web") and phone_locked():
         report("error", "Phone is locked — unlock it and try again", "failed")
         return True
     try:

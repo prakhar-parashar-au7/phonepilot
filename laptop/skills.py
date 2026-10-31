@@ -330,4 +330,22 @@ def hinge(task, ctx):
     return True
 
 
-SKILLS = {"blinkit": blinkit, "whatsapp_triage": whatsapp_triage, "hinge": hinge}
+# ───────────────────────────── Web lookup: Anakin search, answer streamed to the page ──────────────
+
+def web(task, ctx):
+    t0 = time.time()
+    query = re.sub(r"^(search|look ?up|find|google|check)( the web| online)?( for)?\s*", "", task.strip(), flags=re.I) or task
+    step(ctx, f'1. Searching the web with Anakin: "{query[:80]}"')
+    text = ctx.web_search(query)
+    if not text:
+        ctx.report("error", "Web search unavailable", "failed")
+        return True
+    chunks = [line.strip() for line in text.splitlines() if line.strip()]
+    for c in chunks[:6]:
+        for i in range(0, len(c), 290):
+            step(ctx, c[i:i + 290])
+    ctx.report("done", f"Web answer in {time.time() - t0:.0f}s (via Anakin)", "done")
+    return True
+
+
+SKILLS = {"blinkit": blinkit, "whatsapp_triage": whatsapp_triage, "hinge": hinge, "web": web}
