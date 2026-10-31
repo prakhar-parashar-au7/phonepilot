@@ -92,6 +92,26 @@ python3 laptop/pilot.py                                   # interactive prompt �
 python3 laptop/pilot.py "open WhatsApp and say hi to Vaishnav"
 ```
 
+### Hosted mode (web app → cloud → phone)
+The worker also serves a web app at `/` (passcode-protected, mic button, live step log, Stop, Clear all).
+Tasks go into a `TaskInbox` Durable Object; the phone host pulls them — it only makes outbound calls.
+```sh
+npx wrangler secret put PHONEPILOT_WEB_PASSCODE     # once, in worker/
+python3 laptop/pilot.py --host                      # next to the phone
+```
+Routes: `POST /v1/tasks`, `GET /v1/tasks/:id`, `POST /v1/tasks/:id/cancel`, `POST /v1/tasks/clear` (web, `x-passcode`);
+`POST /v1/host/next`, `POST /v1/host/tasks/:id/events` (host, bearer device token). Queued tasks expire after 10 min.
+
+### Working on the web UI locally (no phone, no OpenAI key)
+The page is the `PAGE` string at the bottom of `worker/src/tasks.ts`.
+```sh
+cd worker && npm install
+printf 'PHONEPILOT_WEB_PASSCODE=dev\nPHONEPILOT_DEVICE_TOKEN=dev-token\nOPENAI_API_KEY=not-needed\n' > .dev.vars   # gitignored
+npx wrangler dev                                    # http://localhost:8787, passcode "dev"
+python3 ../laptop/fake_host.py                      # second terminal: fakes a phone run
+npm test
+```
+
 ### 4. Build / test the Android app
 ```sh
 export ANDROID_HOME=<sdk path>   # e.g. /opt/homebrew/share/android-commandlinetools

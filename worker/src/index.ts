@@ -1,4 +1,9 @@
+import { handleTaskRoutes, TaskInbox } from "./tasks";
+export { TaskInbox };
+
 export interface Env {
+  PHONEPILOT_WEB_PASSCODE?: string;
+  TASK_INBOX?: { idFromName(name: string): unknown; get(id: unknown): { fetch(request: Request): Promise<Response> } };
   PHONEPILOT_DEVICE_TOKEN: string;
   OPENAI_API_KEY: string;
   DEVICE_RATE_LIMIT: { limit(options: { key: string }): Promise<{ success: boolean }> };
@@ -225,6 +230,8 @@ export class DailyLimitCounter {
 
 const worker = {
   async fetch(request: Request, env: Env): Promise<Response> {
+    const taskResponse = await handleTaskRoutes(request, env);
+    if (taskResponse) return taskResponse;
     if (request.method !== "POST" || new URL(request.url).pathname !== "/v1/next-action") return error(404, "not_found", "Not found");
     const authorization = request.headers.get("authorization");
     const match = authorization?.match(/^Bearer ([^\s]+)$/);

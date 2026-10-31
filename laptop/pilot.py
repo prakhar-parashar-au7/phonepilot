@@ -5,6 +5,7 @@ Loop: adb screen dump -> numbered UI tree -> worker picks ONE action -> adb exec
 
     python3 laptop/pilot.py                      # interactive: dictate tasks (Wispr Flow) at the prompt
     python3 laptop/pilot.py "open YouTube and play the first video"
+    python3 laptop/pilot.py --host               # pull tasks from the hosted web app and run them
 
 Env: ANDROID_SERIAL (adb device), PHONEPILOT_WORKER_URL (optional override).
 Token is read from the macOS Keychain (service phonepilot-device-token); never printed.
@@ -56,6 +57,19 @@ def bounds_center(b):
     return (x1 + x2) // 2, (y1 + y2) // 2
 
 
+def phone_locked():
+    """True if the screen is off or the keyguard is up. Wakes the screen as a side effect."""
+    power = adb("shell", "dumpsys", "power").stdout
+    if "mWakefulness=Awake" not in power:
+        adb("shell", "input", "keyevent", "224")  # WAKEUP
+        time.sleep(0.8)
+    win = adb("shell", "dumpsys", "window").stdout
+    return "isKeyguardShowing=true" in win or "mDreamingLockscreen=true" in win
+
+
+SEND_LABEL = re.compile(r'"(Send|Send message)"', re.I)
+
+
 def snapshot():
     """Return (package, serialized_tree, {index: (x, y)})."""
     xml = ""
@@ -93,7 +107,8 @@ def snapshot():
 def ask_worker(task, package, tree, history, tok):
     body = json.dumps({"task": task, "activePackage": package, "serializedUiTree": tree, "history": history[-25:]}).encode()
     req = urllib.request.Request(WORKER_URL, data=body, method="POST", headers={
-        "Authorization": f"Bearer {tok}", "Content-Type": "application/json"})
+        "Authorization": f"Bearer {tok}", "Content-Type": "application/json",
+        "User-Agent": "PhonePilot-Host/0.1"})
     try:
         with urllib.request.urlopen(req, timeout=45) as r:
             return json.loads(r.read())["action"]
@@ -145,17 +160,79 @@ def describe(a):
     return json.dumps({k: v for k, v in a.items()}, ensure_ascii=False)
 
 
-def run(task, tok):
+def label_of(tree, index):
+    return next((l for l in tree.splitlines() if l.startswith(f"[{index}] ")), "")
+
+
+def step_text(step, a, tree, package, ok, result):
+    t = a["type"]
+    if "index" in a:
+        line = next((l for l in tree.splitlines() if l.startswith(f"[{a['index']}] ")), "")
+        m = re.search(r'"([^"]+)"', line)
+        target = f' "{m.group(1)[:50]}"' if m and m.group(1) else ""
+        verb = {"tap_element": "Tapped", "type_text": f'Typed "{a.get("text", "")[:40]}" into'}[t]
+        text = f"{verb}{target or ' element ' + str(a['index'])}"
+    elif t == "open_app":
+        text = f"Opened {a['packageName']}"
+    else:
+        text = result[:1].upper() + result[1:]
+    return (f"{step}. {text}" + ("" if ok else f" — failed: {result}"))[:300]
+
+
+def host_call(path, tok, body=None):
+    base = WORKER_URL.rsplit("/v1/", 1)[0]
+    req = urllib.request.Request(base + path, data=json.dumps(body or {}).encode(), method="POST", headers={
+        "Authorization": f"Bearer {tok}", "Content-Type": "application/json", "User-Agent": "PhonePilot-Host/0.1"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
+
+
+def host(tok):
+    print(f"{C['b']}PhonePilot host{C['x']} — pulling tasks from {WORKER_URL.rsplit('/v1/', 1)[0]}  (Ctrl-C to quit)")
+    while True:
+        try:
+            t = host_call("/v1/host/next", tok).get("task")
+        except Exception as e:
+            print(f"{C['r']}inbox error: {e}{C['x']}"); time.sleep(3); continue
+        if not t:
+            time.sleep(1.5); continue
+
+        def report(kind, text, status=None, _id=t["id"]):
+            try:
+                body = {"kind": kind, "text": text}
+                if status:
+                    body["status"] = status
+                return bool(host_call(f"/v1/host/tasks/{_id}/events", tok, body).get("cancelled"))
+            except urllib.error.HTTPError as e:
+                return e.code == 404  # task was cleared from the web -> stop
+            except Exception:
+                return False
+
+        try:
+            run(t["task"], tok, report)
+        except Exception as e:
+            print(f"{C['r']}error: {e}{C['x']}")
+            report("error", f"Error: {e}"[:300], "failed")
+
+
+def run(task, tok, report=lambda kind, text, status=None: False):
+    """report() posts progress; returns True if the user cancelled."""
     print(f"\n{C['b']}🎯 {task}{C['x']}")
-    history, t0 = [], time.time()
+    history, t0, fails = [], time.time(), 0
     for step in range(1, MAX_STEPS + 1):
+        if phone_locked():
+            print(f"{C['r']}🔒 Phone is locked — unlock it and retry{C['x']}")
+            report("error", "Phone is locked — unlock it and try again", "failed")
+            return
         package, tree, centers = snapshot()
         a = ask_worker(task + APP_HINT, package, tree, history, tok)
         if a["type"] == "task_complete":
             print(f"{C['g']}✅ Done in {step - 1} steps, {time.time() - t0:.0f}s: {a['summary']}{C['x']}")
+            report("done", f"Done in {step - 1} steps, {time.time() - t0:.0f}s — {a['summary']}"[:300], "done")
             return
         if a["type"] == "ask_user":
             print(f"{C['y']}✋ {a.get('question')}{C['x']}")
+            report("error", f"Needs you: {a.get('question')}"[:300], "failed")
             return
         ok, result = execute(a, centers)
         label = ""
@@ -164,12 +241,31 @@ def run(task, tok):
             label = f" {C['dim']}{line[:70]}{C['x']}"
         print(f"{C['c']}{step:>2}.{C['x']} {a['type']}{label} {C['dim']}({package}){C['x']}" + ("" if ok else f" {C['r']}✗ {result}{C['x']}"))
         history.append({"action": describe(a)[:300], "result": result[:300], "success": ok})
+        if report("step" if ok else "error", step_text(step, a, tree, package, ok, result)):
+            print(f"{C['r']}⏹ Stopped from the web{C['x']}")
+            return
+        # Guard: a message is sent at most once per task — stop right after a successful Send tap.
+        if ok and a["type"] == "tap_element" and SEND_LABEL.search(label_of(tree, a["index"])):
+            time.sleep(1)
+            print(f"{C['g']}✅ Sent — stopping after one send ({time.time() - t0:.0f}s){C['x']}")
+            report("done", f"Message sent in {step} steps, {time.time() - t0:.0f}s", "done")
+            return
+        # Guard: three failed actions in a row means we're lost — stop instead of wandering.
+        fails = 0 if ok else fails + 1
+        if fails >= 3:
+            print(f"{C['r']}⏹ Stuck — 3 failed actions in a row{C['x']}")
+            report("error", "Stuck after 3 failed actions — stopped safely", "failed")
+            return
         time.sleep(1.2 if a["type"] in ("open_app", "tap_element") else 0.6)
     print(f"{C['r']}⏹ Step cap reached{C['x']}")
+    report("error", "Step cap reached", "failed")
 
 
 def main():
     tok = token()
+    if sys.argv[1:2] == ["--host"]:
+        host(tok)
+        return
     if len(sys.argv) > 1:
         run(" ".join(sys.argv[1:]), tok)
         return

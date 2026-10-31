@@ -5,11 +5,13 @@
   "compatibility_date": "2026-10-03",
   "durable_objects": {
     "bindings": [
-      { "name": "DAILY_LIMIT", "class_name": "DailyLimitCounter" }
+      { "name": "DAILY_LIMIT", "class_name": "DailyLimitCounter" },
+      { "name": "TASK_INBOX", "class_name": "TaskInbox" }
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["DailyLimitCounter"] }
+    { "tag": "v1", "new_sqlite_classes": ["DailyLimitCounter"] },
+    { "tag": "v2", "new_sqlite_classes": ["TaskInbox"] }
   ],
   "ratelimits": [
     {
