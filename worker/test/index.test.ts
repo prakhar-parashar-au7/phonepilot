@@ -134,7 +134,7 @@ describe("PhonePilot worker", () => {
     expect(identifier.status).toBe(400);
   });
 
-  it("instructs the model to continue ordinary multi-step tasks without asking by default", async () => {
+  it("instructs the model never to invent personal data and to ask instead", async () => {
     let providerRequest: Record<string, unknown> | undefined;
     const env = makeEnv({ provider: vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       providerRequest = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -145,10 +145,10 @@ describe("PhonePilot worker", () => {
 
     const input = providerRequest?.input as Array<{ role: string; content: string }>;
     expect(input.find((message) => message.role === "system")?.content)
-      .toContain("Do not recommend ask_user: it is not an available action");
+      .toContain("NEVER invent, guess, or use placeholder values for phone numbers");
   });
 
-  it("does not expose ask_user as a model action", async () => {
+  it("exposes ask_user as a model action for two-way questions", async () => {
     let providerRequest: Record<string, unknown> | undefined;
     const env = makeEnv({ provider: vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       providerRequest = JSON.parse(String(init?.body)) as Record<string, unknown>;
@@ -158,7 +158,7 @@ describe("PhonePilot worker", () => {
     await worker.fetch(post(), env, {} as ExecutionContext);
 
     const variants = ((providerRequest?.text as any).format.schema.properties.action.anyOf) as Array<{ properties: { type: { const: string } } }>;
-    expect(variants.map((variant) => variant.properties.type.const)).not.toContain("ask_user");
+    expect(variants.map((variant) => variant.properties.type.const)).toContain("ask_user");
   });
 
   it("sends strict object schemas for every action alternative", async () => {

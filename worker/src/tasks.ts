@@ -5,17 +5,20 @@
  *   POST /v1/tasks              {task}        -> {id}
  *   GET  /v1/tasks/:id                        -> {task}
  *   POST /v1/tasks/:id/cancel                 -> {task}
+ *   POST /v1/tasks/:id/answer  {answer}      -> {task}   (reply to the agent's question)
  *   POST /v1/tasks/clear                      -> {cleared}  (deletes every task; a running one stops)
  * Host routes (Bearer PHONEPILOT_DEVICE_TOKEN):
  *   POST /v1/host/next                        -> {task} | {task:null}
- *   POST /v1/host/tasks/:id/events {kind,text,status?} -> {cancelled}
+ *   POST /v1/host/tasks/:id/events {kind,text,status?} -> {cancelled}   kind "ask" + status "waiting" asks the user
+ *   POST /v1/host/tasks/:id/answer            -> {status, answer|null}
  *
  * The phone host only ever connects outward; nothing on the internet can reach the phone.
  */
 
-export type TaskStatus = "queued" | "running" | "done" | "failed" | "cancelled" | "expired";
-export type TaskEvent = { at: number; kind: "info" | "step" | "done" | "error"; text: string };
-export type Task = { id: string; task: string; status: TaskStatus; createdAt: number; updatedAt: number; events: TaskEvent[] };
+export type TaskStatus = "queued" | "running" | "waiting" | "done" | "failed" | "cancelled" | "expired";
+export type TaskEvent = { at: number; kind: "info" | "step" | "done" | "error" | "ask" | "answer"; text: string };
+export type Task = { id: string; task: string; skill: string | null; status: TaskStatus; createdAt: number; updatedAt: number; events: TaskEvent[]; question?: string | null; answer?: string | null };
+export const SKILLS = ["blinkit"];
 
 export interface KvStorage {
   get<T>(key: string): Promise<T | undefined>;
@@ -46,9 +49,9 @@ export class TaskInbox {
     return task;
   }
 
-  async create(text: string): Promise<Task> {
+  async create(text: string, skill: string | null = null): Promise<Task> {
     const t = this.now();
-    const task: Task = { id: `${t.toString(36)}-${crypto.randomUUID().slice(0, 8)}`, task: text, status: "queued", createdAt: t, updatedAt: t, events: [] };
+    const task: Task = { id: `${t.toString(36)}-${crypto.randomUUID().slice(0, 8)}`, task: text, skill, status: "queued", createdAt: t, updatedAt: t, events: [] };
     task.events.push({ at: t, kind: "info", text: "Queued — waiting for the phone" });
     return this.save(task);
   }
@@ -83,8 +86,28 @@ export class TaskInbox {
     if (FINAL.includes(task.status)) return { cancelled: false };
     if (task.events.length < MAX_EVENTS) task.events.push({ at: this.now(), kind, text });
     if (status && FINAL.includes(status)) task.status = status;
+    if (status === "waiting" && kind === "ask") { task.status = "waiting"; task.question = text; task.answer = null; }
     await this.save(task);
     return { cancelled: false };
+  }
+
+  async answer(id: string, text: string): Promise<Task | undefined> {
+    const task = await this.get(id);
+    if (!task || task.status !== "waiting") return task;
+    task.answer = text;
+    task.question = null;
+    task.status = "running";
+    task.events.push({ at: this.now(), kind: "answer", text });
+    return this.save(task);
+  }
+
+  /** Host side: has the user answered yet? Consumes the answer once. */
+  async takeAnswer(id: string): Promise<{ status: TaskStatus; answer: string | null } | null> {
+    const task = await this.get(id);
+    if (!task) return null;
+    const answer = task.answer ?? null;
+    if (answer !== null) { task.answer = null; await this.save(task); }
+    return { status: task.status, answer };
   }
 
   async cancel(id: string): Promise<Task | undefined> {
@@ -107,7 +130,9 @@ export class TaskInbox {
     try { body = (await request.json()) as Record<string, unknown>; } catch { /* empty */ }
     const op = new URL(request.url).pathname.slice(1);
     const id = typeof body.id === "string" ? body.id : "";
-    if (op === "create") return json({ task: await this.create(String(body.task)) });
+    if (op === "create") return json({ task: await this.create(String(body.task), typeof body.skill === "string" ? body.skill : null) });
+    if (op === "answer") return json({ task: (await this.answer(id, String(body.answer))) ?? null });
+    if (op === "take-answer") return json(await this.takeAnswer(id));
     if (op === "get") return json({ task: (await this.get(id)) ?? null });
     if (op === "claim") return json({ task: await this.claim() });
     if (op === "clear") return json({ cleared: await this.clear() });
@@ -133,7 +158,7 @@ function safeEqual(a: string, b: string): boolean {
 }
 
 const SENSITIVE = /\b(?:otp|one[ -]?time[ -]?password|password|cvv|pin|account number|card number|credential)\b/i;
-const KINDS = ["info", "step", "done", "error"];
+const KINDS = ["info", "step", "done", "error", "ask"];
 const ID = /^[a-z0-9]+-[a-f0-9]{8}$/;
 
 async function call(env: TaskEnv, op: string, body: unknown = {}): Promise<Response> {
@@ -163,13 +188,25 @@ export async function handleTaskRoutes(request: Request, env: TaskEnv): Promise<
       const task = typeof (body as { task?: unknown })?.task === "string" ? (body as { task: string }).task.trim() : "";
       if (task.length < 2 || task.length > 400) return fail(400, "invalid_request");
       if (SENSITIVE.test(task)) return fail(400, "sensitive_content_blocked");
-      const res = await call(env, "create", { task });
+      const rawSkill = (body as { skill?: unknown }).skill;
+      const skill = rawSkill === undefined || rawSkill === null || rawSkill === "" ? null : String(rawSkill);
+      if (skill !== null && !SKILLS.includes(skill)) return fail(400, "unknown_skill");
+      const res = await call(env, "create", { task, skill });
       const created = ((await res.json()) as { task: Task }).task;
       return json({ id: created.id, task: created }, 201);
     }
     if (request.method === "POST" && pathname === "/v1/tasks/clear") return call(env, "clear");
-    const m = pathname.match(/^\/v1\/tasks\/([^/]+)(\/cancel)?$/);
+    const m = pathname.match(/^\/v1\/tasks\/([^/]+)(\/cancel|\/answer)?$/);
     if (!m || !ID.test(m[1])) return fail(404, "not_found");
+    if (request.method === "POST" && m[2] === "/answer") {
+      let body: unknown;
+      try { body = await request.json(); } catch { return fail(400, "invalid_request"); }
+      const answer = typeof (body as { answer?: unknown })?.answer === "string" ? (body as { answer: string }).answer.trim() : "";
+      if (answer.length < 1 || answer.length > 200) return fail(400, "invalid_request");
+      if (SENSITIVE.test(answer)) return fail(400, "sensitive_content_blocked");
+      const { task } = (await (await call(env, "answer", { id: m[1], answer })).json()) as { task: Task | null };
+      return task ? json({ task }) : fail(404, "not_found");
+    }
     if (request.method === "GET" && !m[2]) {
       const { task } = (await (await call(env, "get", { id: m[1] })).json()) as { task: Task | null };
       return task ? json({ task }) : fail(404, "not_found");
@@ -186,13 +223,19 @@ export async function handleTaskRoutes(request: Request, env: TaskEnv): Promise<
   if (!auth || !safeEqual(auth[1], env.PHONEPILOT_DEVICE_TOKEN)) return fail(401, "unauthorized");
   if (request.method !== "POST") return fail(405, "method_not_allowed");
   if (pathname === "/v1/host/next") return call(env, "claim");
+  const a = pathname.match(/^\/v1\/host\/tasks\/([^/]+)\/answer$/);
+  if (a && ID.test(a[1])) {
+    const result = await (await call(env, "take-answer", { id: a[1] })).json();
+    return result ? json(result) : fail(404, "not_found");
+  }
   const m = pathname.match(/^\/v1\/host\/tasks\/([^/]+)\/events$/);
   if (!m || !ID.test(m[1])) return fail(404, "not_found");
   let body: Record<string, unknown>;
   try { body = (await request.json()) as Record<string, unknown>; } catch { return fail(400, "invalid_request"); }
   const status = body.status;
   if (!KINDS.includes(String(body.kind)) || typeof body.text !== "string" || body.text.length < 1 || body.text.length > 300) return fail(400, "invalid_request");
-  if (status !== undefined && !["done", "failed"].includes(String(status))) return fail(400, "invalid_request");
+  if (status !== undefined && !["done", "failed", "waiting"].includes(String(status))) return fail(400, "invalid_request");
+  if (status === "waiting" && body.kind !== "ask") return fail(400, "invalid_request");
   const res = await call(env, "event", { id: m[1], kind: body.kind, text: body.text, status });
   const result = await res.json();
   return result ? json(result) : fail(404, "not_found");
@@ -223,11 +266,21 @@ const PAGE = `<!doctype html>
   .done{color:var(--acc)}.error{color:var(--err)}.info{color:var(--dim)}
   #status{font-weight:600;margin-bottom:6px}.pass{margin-bottom:12px}
   .ghost{background:transparent;border:1px solid var(--line);color:var(--dim);flex:1;font-weight:500}
+  .skills{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}.lbl{color:var(--dim);font-size:13px;margin-right:4px}
+  .skill{background:#1b2130;border:1px solid var(--line);color:var(--fg);padding:8px 14px;font-weight:500}
+  .skill.on{background:var(--acc);color:#04291c;border-color:var(--acc)}
+  #ask{display:none;background:#2a2210;border:1px solid var(--warn);border-radius:12px;padding:12px;margin:8px 0}
+  #q{color:var(--warn);font-weight:600}#reply{background:var(--warn);color:#2a1d00}
+  .ask{color:var(--warn)}.answer{color:#93c5fd}
   footer{color:var(--dim);font-size:12px;margin-top:26px;text-align:center}
 </style></head><body><main>
 <h1>📱 PhonePilot</h1><p class="sub">Say it. Watch the phone do it.</p>
 <div class="card">
   <input id="pass" class="pass" type="password" placeholder="Passcode" autocomplete="current-password">
+  <div class="skills"><span class="lbl">Skill</span>
+    <button class="skill on" data-skill="">✨ Any app</button>
+    <button class="skill" data-skill="blinkit">🛒 Blinkit</button>
+  </div>
   <textarea id="task" placeholder="e.g. Open WhatsApp and say hi to Vaishnav"></textarea>
   <div class="row"><button id="mic" title="Speak">🎙</button><button id="go">Run on phone</button><button id="stop">Stop</button></div>
   <div class="row"><button id="clear" class="ghost">Clear all tasks · start fresh</button></div>
@@ -237,7 +290,9 @@ const PAGE = `<!doctype html>
     <span class="chip">Open Blinkit and search for tomato</span>
   </div>
 </div>
-<div id="log" class="card"><div id="status"></div><div id="events"></div></div>
+<div id="log" class="card"><div id="status"></div>
+  <div id="ask"><div id="q"></div><div class="row"><input id="ans" placeholder="Type your answer"><button id="reply">Reply</button></div></div>
+  <div id="events"></div></div>
 <footer>Your phone, your logins. Payments and OTPs are never automated.</footer>
 </main><script>
 const $=s=>document.querySelector(s),clearBtn=$('#clear'),pass=$('#pass'),task=$('#task'),go=$('#go'),stop=$('#stop'),mic=$('#mic');
@@ -245,20 +300,22 @@ pass.value=localStorage.getItem('pp_pass')||'';
 document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{task.value=c.textContent;task.focus()});
 let current=null,timer=null,t0=0;
 const api=(path,opt={})=>fetch(path,{...opt,headers:{'content-type':'application/json','x-passcode':pass.value,...(opt.headers||{})}});
-const LABEL={queued:'⏳ Queued',running:'🤖 Working on the phone…',done:'✅ Done',failed:'⚠️ Failed',cancelled:'⏹ Stopped',expired:'⌛ Expired'};
+const LABEL={waiting:'🙋 Needs your answer',queued:'⏳ Queued',running:'🤖 Working on the phone…',done:'✅ Done',failed:'⚠️ Failed',cancelled:'⏹ Stopped',expired:'⌛ Expired'};
 function render(t){
   $('#log').style.display='block';$('#status').textContent=LABEL[t.status]||t.status;
   $('#events').innerHTML='';
   for(const e of t.events){const d=document.createElement('div');d.className='ev';
     const tt=document.createElement('span');tt.className='t';tt.textContent='+'+Math.max(0,Math.round((e.at-t.createdAt)/1000))+'s';
     const tx=document.createElement('span');tx.className=e.kind;tx.textContent=e.text;d.append(tt,tx);$('#events').append(d)}
-  const live=t.status==='queued'||t.status==='running';stop.style.display=live?'block':'none';go.disabled=live;
+  const wait=t.status==='waiting';$('#ask').style.display=wait?'block':'none';
+  if(wait){$('#q').textContent=t.question||'The agent has a question';if(document.activeElement!==$('#ans'))$('#ans').focus()}
+  const live=t.status==='queued'||t.status==='running'||wait;stop.style.display=live?'block':'none';go.disabled=live;
   if(!live){clearInterval(timer);timer=null}
 }
 async function poll(){if(!current)return;const r=await api('/v1/tasks/'+current);if(r.ok)render((await r.json()).task)}
 go.onclick=async()=>{
   localStorage.setItem('pp_pass',pass.value);
-  const r=await api('/v1/tasks',{method:'POST',body:JSON.stringify({task:task.value})});
+  const r=await api('/v1/tasks',{method:'POST',body:JSON.stringify({task:task.value,skill:skill||null})});
   const j=await r.json();
   if(!r.ok){$('#log').style.display='block';$('#status').textContent='⚠️ '+(j.error?.message||r.status);$('#events').innerHTML='';return}
   current=j.id;render(j.task);clearInterval(timer);timer=setInterval(poll,1000);
@@ -272,6 +329,13 @@ clearBtn.onclick=async()=>{
   $('#log').style.display='block';$('#events').innerHTML='';
   $('#status').textContent=r.ok?'🧹 Cleared '+j.cleared+' task(s). Fresh start.':'⚠️ '+(j.error?.message||r.status);
 };
+let skill='';
+document.querySelectorAll('.skill').forEach(b=>b.onclick=()=>{document.querySelectorAll('.skill').forEach(x=>x.classList.remove('on'));b.classList.add('on');skill=b.dataset.skill;
+  task.placeholder=skill==='blinkit'?'e.g. order tomato':'e.g. Open WhatsApp and say hi to Vaishnav'});
+$('#reply').onclick=async()=>{const v=$('#ans').value.trim();if(!v||!current)return;
+  const r=await api('/v1/tasks/'+current+'/answer',{method:'POST',body:JSON.stringify({answer:v})});
+  if(r.ok){$('#ans').value='';render((await r.json()).task)}};
+$('#ans').onkeydown=e=>{if(e.key==='Enter')$('#reply').click()};
 const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
 if(!SR){mic.title='Voice not supported in this browser';mic.style.opacity=.4}
 else{const rec=new SR();rec.lang='en-IN';rec.interimResults=true;rec.continuous=false;

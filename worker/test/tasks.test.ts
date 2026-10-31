@@ -91,6 +91,27 @@ describe("hosted tasks", () => {
     expect((await req("/v1/tasks/clear", { method: "POST" })).status).toBe(401);
   });
 
+  it("asks the user and hands the answer back to the host once", async () => {
+    const { req } = setup();
+    const { id } = (await (await req("/v1/tasks", { method: "POST", web: true, body: JSON.stringify({ task: "Log me into Tinder", skill: null }) })).json()) as { id: string };
+    await req("/v1/host/next", { method: "POST", host: true });
+    await req(`/v1/host/tasks/${id}/events`, { method: "POST", host: true, body: JSON.stringify({ kind: "ask", text: "What is your phone number?", status: "waiting" }) });
+    const waiting = (await (await req(`/v1/tasks/${id}`, { web: true })).json()) as { task: { status: string; question: string } };
+    expect(waiting.task).toMatchObject({ status: "waiting", question: "What is your phone number?" });
+    expect(await (await req(`/v1/host/tasks/${id}/answer`, { method: "POST", host: true })).json()).toEqual({ status: "waiting", answer: null });
+    await req(`/v1/tasks/${id}/answer`, { method: "POST", web: true, body: JSON.stringify({ answer: "9876543210" }) });
+    expect(await (await req(`/v1/host/tasks/${id}/answer`, { method: "POST", host: true })).json()).toEqual({ status: "running", answer: "9876543210" });
+    expect(await (await req(`/v1/host/tasks/${id}/answer`, { method: "POST", host: true })).json()).toEqual({ status: "running", answer: null });
+  });
+
+  it("accepts known skills and rejects unknown ones", async () => {
+    const { req } = setup();
+    expect((await req("/v1/tasks", { method: "POST", web: true, body: JSON.stringify({ task: "order tomato", skill: "blinkit" }) })).status).toBe(201);
+    expect((await req("/v1/tasks", { method: "POST", web: true, body: JSON.stringify({ task: "order tomato", skill: "rm-rf" }) })).status).toBe(400);
+    const claimed = (await (await req("/v1/host/next", { method: "POST", host: true })).json()) as { task: { skill: string } };
+    expect(claimed.task.skill).toBe("blinkit");
+  });
+
   it("blocks sensitive tasks and keeps next-action 404s intact", async () => {
     const { req } = setup();
     expect((await req("/v1/tasks", { method: "POST", web: true, body: JSON.stringify({ task: "type my OTP 1234" }) })).status).toBe(400);

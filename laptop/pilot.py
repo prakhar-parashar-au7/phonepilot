@@ -33,6 +33,16 @@ APP_HINT = (
 C = {"dim": "\033[2m", "b": "\033[1m", "g": "\033[32m", "y": "\033[33m", "r": "\033[31m", "c": "\033[36m", "x": "\033[0m"}
 
 
+def resolve_serial():
+    """Pin ANDROID_SERIAL to the phone's current wireless-debugging address (port changes on reconnect)."""
+    if os.environ.get("ANDROID_SERIAL"):
+        return
+    out = subprocess.run(["adb", "devices"], capture_output=True, text=True).stdout
+    ips = [l.split()[0] for l in out.splitlines()[1:] if l.endswith("device") and re.match(r"\d+\.\d+\.\d+\.\d+:\d+", l)]
+    if ips:
+        os.environ["ANDROID_SERIAL"] = ips[0]
+
+
 def adb(*args, timeout=20):
     return subprocess.run(["adb", *args], capture_output=True, text=True, timeout=timeout)
 
@@ -204,18 +214,37 @@ def host(tok):
                     body["status"] = status
                 return bool(host_call(f"/v1/host/tasks/{_id}/events", tok, body).get("cancelled"))
             except urllib.error.HTTPError as e:
+                print(f"{C['r']}report {kind} failed: HTTP {e.code} {e.read().decode()[:120]}{C['x']}")
                 return e.code == 404  # task was cleared from the web -> stop
-            except Exception:
+            except Exception as e:
+                print(f"{C['r']}report {kind} failed: {e}{C['x']}")
                 return False
 
+        def wait_answer(_id=t["id"], timeout=300):
+            end = time.time() + timeout
+            while time.time() < end:
+                try:
+                    r = host_call(f"/v1/host/tasks/{_id}/answer", tok)
+                except urllib.error.HTTPError as e:
+                    print(f"{C['r']}answer poll failed: HTTP {e.code}{C['x']}")
+                    return None  # task cleared
+                if r.get("status") not in ("waiting", "running"):
+                    print(f"{C['dim']}task is now {r.get('status')}{C['x']}")
+                if r.get("answer"):
+                    return r["answer"]
+                if r.get("status") not in ("waiting", "running"):
+                    return None  # cancelled / expired
+                time.sleep(1.2)
+            return None
+
         try:
-            run(t["task"], tok, report)
+            run(t["task"], tok, report, wait_answer)
         except Exception as e:
             print(f"{C['r']}error: {e}{C['x']}")
             report("error", f"Error: {e}"[:300], "failed")
 
 
-def run(task, tok, report=lambda kind, text, status=None: False):
+def run(task, tok, report=lambda kind, text, status=None: False, wait_answer=None):
     """report() posts progress; returns True if the user cancelled."""
     print(f"\n{C['b']}🎯 {task}{C['x']}")
     history, t0, fails = [], time.time(), 0
@@ -231,9 +260,21 @@ def run(task, tok, report=lambda kind, text, status=None: False):
             report("done", f"Done in {step - 1} steps, {time.time() - t0:.0f}s — {a['summary']}"[:300], "done")
             return
         if a["type"] == "ask_user":
-            print(f"{C['y']}✋ {a.get('question')}{C['x']}")
-            report("error", f"Needs you: {a.get('question')}"[:300], "failed")
-            return
+            q = a.get("question", "The agent needs more information")
+            print(f"{C['y']}🙋 {q}{C['x']}")
+            if wait_answer is None:  # terminal mode: ask right here
+                answer = input(f"{C['y']}   your answer › {C['x']}").strip()
+            else:
+                if report("ask", q[:300], "waiting"):
+                    return
+                answer = wait_answer()
+            if not answer:
+                print(f"{C['r']}⏹ No answer — stopped{C['x']}")
+                report("error", "No answer received — stopped", "failed")
+                return
+            print(f"{C['b']}   ↳ {answer}{C['x']}")
+            history.append({"action": f"ask_user: {q}"[:300], "result": f"User replied: {answer}"[:300], "success": True})
+            continue
         ok, result = execute(a, centers)
         label = ""
         if "index" in a:
@@ -263,6 +304,8 @@ def run(task, tok, report=lambda kind, text, status=None: False):
 
 def main():
     tok = token()
+    resolve_serial()
+    print(f"{C['dim']}device: {os.environ.get('ANDROID_SERIAL', 'default')}{C['x']}")
     if sys.argv[1:2] == ["--host"]:
         host(tok)
         return
