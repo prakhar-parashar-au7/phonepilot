@@ -406,7 +406,7 @@ footer{text-align:center;padding:24px 16px 32px}
   <div class="hero">
     <div class="hero-copy">
       <div class="kicker">YOUR PERSONAL PHONE AGENT</div>
-      <h2>Say what you need.<br>Watch the phone do it.</h2>
+      <h2>Say what you need.<br>A phone gets it done.</h2>
       <p>Speak naturally or type a task. PhonePilot runs it on your real Android phone and shows you every step live.</p>
       <div class="chips">
         <span class="chip">Open WhatsApp and say hi to Vaishnav</span>
