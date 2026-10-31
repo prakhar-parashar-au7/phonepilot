@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">PhonePilot</string>
+    <string name="accessibility_service_description">Lets PhonePilot inspect and operate allowed app screens after your instruction.</string>
+</resources>

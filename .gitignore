@@ -1,0 +1,14 @@
+.gradle/
+.kotlin/
+build/
+local.properties
+.worktrees/
+*.iml
+.idea/
+.DS_Store
+node_modules/
+.wrangler/
+.superpowers/
+__pycache__/
+.env
+.dev.vars
