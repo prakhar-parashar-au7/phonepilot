@@ -20,6 +20,10 @@ import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import skills as skills_mod  # noqa: E402
+from skills import SKILLS  # noqa: E402
+
 WORKER_URL = os.environ.get(
     "PHONEPILOT_WORKER_URL",
     "https://phonepilot-agent.prakhar24680.workers.dev/v1/next-action",
@@ -44,7 +48,7 @@ def resolve_serial():
 
 
 def adb(*args, timeout=20):
-    return subprocess.run(["adb", *args], capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(["adb", *args], capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
 
 
 def token():
@@ -197,6 +201,52 @@ def host_call(path, tok, body=None):
         return json.loads(r.read())
 
 
+class SkillCtx:
+    def __init__(self, tok, report, wait_answer):
+        self.tok, self.report, self._wait = tok, report, wait_answer
+        self.snapshot, self.adb = snapshot, adb
+
+    def ask(self, q):
+        if self._wait is None:
+            return input(f"{C['y']}🙋 {q}\n   your answer › {C['x']}").strip()
+        if self.report("ask", q[:300], "waiting"):
+            raise skills_mod.Stop("cancelled")
+        return self._wait()
+
+    def llm_loop(self, sub_task, approve_send=None):
+        # Sub-loop: its done/failed must not finish the parent task.
+        def sub_report(kind, text, status=None):
+            if status in ("done", "failed"):
+                kind, status = ("step" if kind == "done" else kind), None
+            return self.report(kind, text, status)
+        return run(sub_task, self.tok, sub_report, self._wait, approve_send=approve_send)
+
+
+SKILL_SCOPE = {
+    "blinkit": "Use ONLY the Blinkit app (package com.grofers.customerapp); never open any other app. "
+               "Search for the item, add it to the cart, open the cart, and stop before payment. Task: ",
+    "whatsapp_triage": "Use ONLY WhatsApp (package com.whatsapp); never open any other app. Never send in group chats. Task: ",
+}
+
+
+def skill_task(skill, task):
+    """The LLM fallback for a skill stays inside that skill's app."""
+    return SKILL_SCOPE.get(skill or "", "") + task
+
+
+def run_skill(skill, task, tok, report, wait_answer=None):
+    """True if the skill finished the task (or stopped cleanly); False to fall back to the LLM loop."""
+    ctx = SkillCtx(tok, report, wait_answer)
+    if phone_locked():
+        report("error", "Phone is locked — unlock it and try again", "failed")
+        return True
+    try:
+        return skill(task, ctx)
+    except skills_mod.Stop:
+        report("error", "Stopped", "failed")
+        return True
+
+
 def host(tok):
     print(f"{C['b']}PhonePilot host{C['x']} — pulling tasks from {WORKER_URL.rsplit('/v1/', 1)[0]}  (Ctrl-C to quit)")
     while True:
@@ -237,44 +287,62 @@ def host(tok):
                 time.sleep(1.2)
             return None
 
+        skill = SKILLS.get(t.get("skill") or "")
         try:
-            run(t["task"], tok, report, wait_answer)
+            if skill:
+                print(f"\n{C['b']}🧩 skill {t['skill']}: {t['task']}{C['x']}")
+                if run_skill(skill, t["task"], tok, report, wait_answer):
+                    continue
+                report("info", "Skill couldn't follow the screen — handing over to the general agent")
+            run(skill_task(t.get("skill"), t["task"]), tok, report, wait_answer,
+                approve_send="this chat" if t.get("skill") == "whatsapp_triage" else None)
         except Exception as e:
             print(f"{C['r']}error: {e}{C['x']}")
             report("error", f"Error: {e}"[:300], "failed")
 
 
-def run(task, tok, report=lambda kind, text, status=None: False, wait_answer=None):
-    """report() posts progress; returns True if the user cancelled."""
+def run(task, tok, report=lambda kind, text, status=None: False, wait_answer=None, approve_send=None):
+    """report() posts progress (returns True if the user cancelled).
+    approve_send=<contact>: show any drafted message to the user and send only if they approve.
+    Returns "sent", "done", or "stopped"."""
     print(f"\n{C['b']}🎯 {task}{C['x']}")
     history, t0, fails = [], time.time(), 0
+
+    def ask(q):
+        if wait_answer is None:
+            return input(f"{C['y']}🙋 {q}\n   your answer › {C['x']}").strip()
+        if report("ask", q[:300], "waiting"):
+            return None
+        return wait_answer()
     for step in range(1, MAX_STEPS + 1):
         if phone_locked():
             print(f"{C['r']}🔒 Phone is locked — unlock it and retry{C['x']}")
             report("error", "Phone is locked — unlock it and try again", "failed")
-            return
+            return "stopped"
         package, tree, centers = snapshot()
         a = ask_worker(task + APP_HINT, package, tree, history, tok)
         if a["type"] == "task_complete":
             print(f"{C['g']}✅ Done in {step - 1} steps, {time.time() - t0:.0f}s: {a['summary']}{C['x']}")
             report("done", f"Done in {step - 1} steps, {time.time() - t0:.0f}s — {a['summary']}"[:300], "done")
-            return
+            return "done"
         if a["type"] == "ask_user":
             q = a.get("question", "The agent needs more information")
             print(f"{C['y']}🙋 {q}{C['x']}")
-            if wait_answer is None:  # terminal mode: ask right here
-                answer = input(f"{C['y']}   your answer › {C['x']}").strip()
-            else:
-                if report("ask", q[:300], "waiting"):
-                    return
-                answer = wait_answer()
+            answer = ask(q)
             if not answer:
                 print(f"{C['r']}⏹ No answer — stopped{C['x']}")
                 report("error", "No answer received — stopped", "failed")
-                return
+                return "stopped"
             print(f"{C['b']}   ↳ {answer}{C['x']}")
             history.append({"action": f"ask_user: {q}"[:300], "result": f"User replied: {answer}"[:300], "success": True})
             continue
+        if approve_send and a["type"] == "type_text" and "id=entry" in label_of(tree, a["index"]):
+            ans = ask(f'Reply to {approve_send}: "{a["text"]}" — send it? (yes / no / or type a different reply)')
+            if not ans or ans.strip().lower() in ("no", "n", "skip", "don't", "dont"):
+                report("step", f"Skipped reply to {approve_send}")
+                return "stopped"
+            if ans.strip().lower() not in ("yes", "y", "ok", "send", "haan", "ha"):
+                a = {**a, "text": ans.strip()}
         ok, result = execute(a, centers)
         label = ""
         if "index" in a:
@@ -284,22 +352,23 @@ def run(task, tok, report=lambda kind, text, status=None: False, wait_answer=Non
         history.append({"action": describe(a)[:300], "result": result[:300], "success": ok})
         if report("step" if ok else "error", step_text(step, a, tree, package, ok, result)):
             print(f"{C['r']}⏹ Stopped from the web{C['x']}")
-            return
+            return "stopped"
         # Guard: a message is sent at most once per task — stop right after a successful Send tap.
         if ok and a["type"] == "tap_element" and SEND_LABEL.search(label_of(tree, a["index"])):
             time.sleep(1)
             print(f"{C['g']}✅ Sent — stopping after one send ({time.time() - t0:.0f}s){C['x']}")
             report("done", f"Message sent in {step} steps, {time.time() - t0:.0f}s", "done")
-            return
+            return "sent"
         # Guard: three failed actions in a row means we're lost — stop instead of wandering.
         fails = 0 if ok else fails + 1
         if fails >= 3:
             print(f"{C['r']}⏹ Stuck — 3 failed actions in a row{C['x']}")
             report("error", "Stuck after 3 failed actions — stopped safely", "failed")
-            return
+            return "stopped"
         time.sleep(1.2 if a["type"] in ("open_app", "tap_element") else 0.6)
     print(f"{C['r']}⏹ Step cap reached{C['x']}")
     report("error", "Step cap reached", "failed")
+    return "stopped"
 
 
 def main():
@@ -308,6 +377,13 @@ def main():
     print(f"{C['dim']}device: {os.environ.get('ANDROID_SERIAL', 'default')}{C['x']}")
     if sys.argv[1:2] == ["--host"]:
         host(tok)
+        return
+    if sys.argv[1:2] == ["--skill"] and len(sys.argv) > 3:
+        def say(kind, text, status=None):
+            print(f"  {kind}: {text}")
+            return False
+        if not run_skill(SKILLS[sys.argv[2]], " ".join(sys.argv[3:]), tok, say):
+            run(skill_task(sys.argv[2], " ".join(sys.argv[3:])), tok)
         return
     if len(sys.argv) > 1:
         run(" ".join(sys.argv[1:]), tok)
