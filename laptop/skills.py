@@ -228,17 +228,38 @@ def whatsapp_triage(task, ctx):
         if f'"{row["name"]}"' not in header:
             ctx.adb("shell", "input", "keyevent", "4"); continue
         n += 1
-        step(ctx, f'{n}. Reading {row["name"]}')
-        # The LLM decides urgency and drafts; the host gates the send behind the user's approval.
-        sub = (f'You are in the WhatsApp chat with {row["name"]}. Read the latest messages on screen. '
-               f'If they are urgent (time-sensitive, asking for help, a pressing question, an emergency), type one short, '
-               f'friendly, appropriate reply into the Message box and tap Send. If not urgent, do nothing and return task_complete '
-               f'with summary "not urgent: <5-word gist>". Never promise money, never share personal data, never reply in a group.')
-        outcome = ctx.llm_loop(sub, approve_send=row["name"])
-        if outcome == "sent":
+        # One LLM call per chat: the model either drafts a reply (type_text into the box) or says not urgent.
+        sub = (f'You are in the WhatsApp chat with {row["name"]}. Read the latest incoming messages on screen. '
+               f'If they are urgent (time-sensitive, asking for help or a call, a pressing question, an emergency), return '
+               f'type_text into the Message box with one short, friendly, appropriate reply in the same language. '
+               f'Otherwise return task_complete with summary "not urgent: <5-word gist>". '
+               f'Never promise money and never share personal data.')
+        pkg, tree, centers = ctx.snapshot()
+        action = ctx.decide(sub, pkg, tree)
+        box = find(tree, r"id=entry .*editable")
+        if not action or action.get("type") != "type_text" or not box:
+            gist = (action or {}).get("summary", "not urgent")
+            step(ctx, f'{n}. {row["name"]}: {gist}'[:300])
+            ctx.adb("shell", "input", "keyevent", "4"); time.sleep(0.8)
+            continue
+        draft = action["text"]
+        ans = (ctx.ask(f'Urgent from {row["name"]}. Reply "{draft}"? (yes / no / or type your own reply)') or "").strip()
+        if not ans or ans.lower() in ("no", "n", "skip"):
+            step(ctx, f'{n}. Skipped {row["name"]}')
+            ctx.adb("shell", "input", "keyevent", "4"); time.sleep(0.8)
+            continue
+        text = draft if ans.lower() in ("yes", "y", "ok", "send", "haan", "ha") else ans
+        tap(ctx, centers, box[0])
+        time.sleep(0.4)
+        ctx.type_text(text)
+        got = wait_for(ctx, r'"Send" id=send', WHATSAPP, timeout=4)
+        if got:
+            _, tree, centers = got
+            tap(ctx, centers, find(tree, r'"Send" id=send')[0])
+            time.sleep(0.8)
             replied.append(row["name"])
-        ctx.adb("shell", "input", "keyevent", "4")
-        time.sleep(1)
+            step(ctx, f'{n}. Replied to {row["name"]}: "{text}"'[:300])
+        ctx.adb("shell", "input", "keyevent", "4"); time.sleep(0.8)
     summary = (f"Replied to {', '.join(replied)}" if replied else "Nothing urgent — no replies sent") + \
               f" · {skipped} group chat(s) skipped · {time.time() - t0:.0f}s"
     ctx.report("done", summary[:300], "done")

@@ -213,6 +213,17 @@ class SkillCtx:
             raise skills_mod.Stop("cancelled")
         return self._wait()
 
+    def decide(self, sub_task, package, tree):
+        """Exactly one LLM call; returns the action dict or None."""
+        try:
+            return ask_worker(sub_task + APP_HINT, package, tree, [], self.tok)
+        except Exception as e:
+            print(f"{C['r']}decide failed: {e}{C['x']}")
+            return None
+
+    def type_text(self, text):
+        adb("shell", "input", "text", adb_text(text))
+
     def llm_loop(self, sub_task, approve_send=None):
         # Sub-loop: its done/failed must not finish the parent task.
         def sub_report(kind, text, status=None):
